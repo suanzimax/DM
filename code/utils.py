@@ -162,8 +162,12 @@ def ensure_metadata_columns(df):
         df["shot_mean"] = df["energy"]
     if "shot_std" not in df.columns:
         df["shot_std"] = 0.0
+    if "shot_var" not in df.columns:
+        df["shot_var"] = np.square(df["shot_std"].astype(float))
     if "repeat_count" not in df.columns:
         df["repeat_count"] = 1
+    if "repeat_values" not in df.columns:
+        df["repeat_values"] = ""
     return df
 
 

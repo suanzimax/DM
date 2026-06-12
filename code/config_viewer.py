@@ -4,7 +4,7 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from config import VOLTAGE_BOUNDS
+from config import MAX_DELTA_FROM_BASELINE, OPTIMIZED_DIM_INDICES, VOLTAGE_BOUNDS
 
 
 class ConfigViewer:
@@ -48,12 +48,12 @@ class ConfigViewer:
         table_frame = tk.Frame(self.window)
         table_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        columns = ("执行器", "基准电压", "配置电压", "电压变化")
+        columns = ("执行器", "基准电压", "配置电压", "电压变化", "安全占比", "状态")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=20)
 
         for col in columns:
             self.tree.heading(col, text=col)
-            self.tree.column(col, width=150, anchor="center")
+            self.tree.column(col, width=118, anchor="center")
 
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
@@ -140,29 +140,64 @@ class ConfigViewer:
             return
 
         out_of_bounds = []
+        delta_out_of_bounds = []
         for i, voltage in enumerate(self.config_data):
             if voltage < VOLTAGE_BOUNDS[0] or voltage > VOLTAGE_BOUNDS[1]:
                 out_of_bounds.append(i)
+            if self.baseline_data and i < len(self.baseline_data):
+                delta = abs(voltage - self.baseline_data[i])
+                if i in OPTIMIZED_DIM_INDICES and delta > MAX_DELTA_FROM_BASELINE:
+                    delta_out_of_bounds.append(i)
+                if i not in OPTIMIZED_DIM_INDICES and delta != 0:
+                    delta_out_of_bounds.append(i)
 
         for i, config_voltage in enumerate(self.config_data):
             if self.baseline_data and i < len(self.baseline_data):
                 baseline_voltage = self.baseline_data[i]
                 voltage_change = config_voltage - baseline_voltage
-                values = (f"A{i}", baseline_voltage, config_voltage, f"{voltage_change:+d}")
+                usage = abs(voltage_change) / max(MAX_DELTA_FROM_BASELINE, 1)
+                if i not in OPTIMIZED_DIM_INDICES:
+                    status = "固定" if voltage_change == 0 else "非优化变动"
+                elif usage > 1.0:
+                    status = "超阈值"
+                elif usage >= 0.9:
+                    status = "接近阈值"
+                else:
+                    status = "安全"
+                values = (
+                    f"A{i}",
+                    baseline_voltage,
+                    config_voltage,
+                    f"{voltage_change:+d}",
+                    f"{usage * 100:.1f}%",
+                    status,
+                )
             else:
-                values = (f"A{i}", "N/A", config_voltage, "N/A")
+                values = (f"A{i}", "N/A", config_voltage, "N/A", "N/A", "N/A")
 
             if i in out_of_bounds:
                 self.tree.insert("", "end", values=values, tags=("warning",))
+            elif i in delta_out_of_bounds:
+                self.tree.insert("", "end", values=values, tags=("delta_warning",))
+            elif self.baseline_data and i in OPTIMIZED_DIM_INDICES and abs(config_voltage - self.baseline_data[i]) >= 0.9 * MAX_DELTA_FROM_BASELINE:
+                self.tree.insert("", "end", values=values, tags=("near_limit",))
             else:
                 self.tree.insert("", "end", values=values)
 
         self.tree.tag_configure("warning", background="lightcoral")
+        self.tree.tag_configure("delta_warning", background="lightcoral")
+        self.tree.tag_configure("near_limit", background="#ffd6d6")
 
-        if out_of_bounds:
+        if out_of_bounds or delta_out_of_bounds:
             self.status_label.config(
-                text=f"警告：检测到 {len(out_of_bounds)} 个电压超限！不能加载到DM中",
+                text=(
+                    f"警告：全局电压超限 {len(out_of_bounds)} 个，"
+                    f"相对基准/冻结维度违规 {len(delta_out_of_bounds)} 个，不能加载到DM中"
+                ),
                 fg="red",
             )
         else:
-            self.status_label.config(text="所有电压值在安全范围内", fg="green")
+            self.status_label.config(
+                text=f"所有电压值在安全范围内；优化维度相对基准不超过 ±{MAX_DELTA_FROM_BASELINE}",
+                fg="green",
+            )

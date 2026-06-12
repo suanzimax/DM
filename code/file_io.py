@@ -26,8 +26,19 @@ def copy_file_to_windows_share(local_filepath):
     前提：Mac 已经通过 Finder 挂载 smb://192.168.10.2/BO0612，
     并且本机路径存在 /Volumes/BO0612。
     """
-    src = Path(local_filepath)
+    src = Path(local_filepath).resolve()
     share_dir = Path(WINDOWS_SHARE_DIR)
+
+    if not src.exists():
+        append_operation_log(
+            "copy_to_windows_share",
+            "error",
+            {
+                "reason": "local_file_not_found",
+                "local_file": str(src),
+            },
+        )
+        return None
 
     if not share_dir.exists():
         append_operation_log(
@@ -43,7 +54,13 @@ def copy_file_to_windows_share(local_filepath):
 
     dst = share_dir / src.name
     try:
-        shutil.copy2(src, dst)
+        # SMB 共享盘经常不支持 copy2 的元数据复制，内容复制成功后仍可能报 Errno 22。
+        # 这里仅复制文件内容，再用大小校验确认结果。
+        shutil.copyfile(src, dst)
+        if dst.stat().st_size != src.stat().st_size:
+            raise IOError(
+                f"copied file size mismatch: src={src.stat().st_size}, dst={dst.stat().st_size}"
+            )
         append_operation_log(
             "copy_to_windows_share",
             "success",
@@ -51,6 +68,21 @@ def copy_file_to_windows_share(local_filepath):
         )
         return str(dst)
     except Exception as exc:
+        if dst.exists():
+            try:
+                if dst.stat().st_size == src.stat().st_size:
+                    append_operation_log(
+                        "copy_to_windows_share",
+                        "success",
+                        {
+                            "local_file": str(src),
+                            "windows_file": str(dst),
+                            "note": f"copy raised {exc!r}, but destination size matches",
+                        },
+                    )
+                    return str(dst)
+            except Exception:
+                pass
         append_operation_log(
             "copy_to_windows_share",
             "error",
@@ -111,13 +143,15 @@ def test_windows_share_write():
     return str(test_file)
 
 
-def save_data(x, energy_mean, shot_std=0.0, repeat_count=1):
+def save_data(x, energy_mean, shot_std=0.0, repeat_count=1, repeat_values=None):
     """保存实验数据到 CSV，同时保留重复 shot 统计信息。"""
     row = {f"a{i}": int(x[i]) for i in range(N_ACTUATORS)}
     row["energy"] = float(energy_mean)
     row["shot_mean"] = float(energy_mean)
     row["shot_std"] = float(shot_std)
+    row["shot_var"] = float(shot_std) ** 2
     row["repeat_count"] = int(repeat_count)
+    row["repeat_values"] = ",".join(str(float(v)) for v in (repeat_values or []))
     df_new = pd.DataFrame([row])
     if not os.path.exists(DATA_FILE):
         df_new.to_csv(index=False, path_or_buf=DATA_FILE)

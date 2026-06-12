@@ -1,58 +1,112 @@
 """模型训练、约束处理、候选点生成和 BO 推荐。"""
 
 import numpy as np
-from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
+import warnings
+from scipy.stats import norm
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 from config import (
     N_ACTUATORS,
     VOLTAGE_BOUNDS,
-    BASELINE_FILE,
     MAX_DELTA_FROM_BASELINE,
-    FROZEN_START_IDX,
     OPTIMIZED_DIM_INDICES,
     MIN_TRUST_RADIUS,
+    GPR_MIN_SAMPLES_TO_TRAIN,
+    GPR_NOISE_FLOOR,
     RF_MIN_SAMPLES_TO_TRAIN,
     RF_TEST_SIZE,
     RF_RANDOM_STATE,
 )
 
 
-def train_surrogate(X, y, mode_params, sample_weights=None):
-    """训练 surrogate 集成模型并返回 holdout RMSE。"""
-    if len(y) < RF_MIN_SAMPLES_TO_TRAIN:
+def train_surrogate(X, y_mean, y_std, mode_params, sample_weights=None):
+    """训练两个 GPR：目标均值模型 + shot 波动模型。"""
+    if len(y_mean) < GPR_MIN_SAMPLES_TO_TRAIN:
         return None, None
-    X_train, X_val, y_train, y_val, w_train, _ = train_test_split(
-        X,
-        y,
-        sample_weights if sample_weights is not None else np.ones(len(y)),
-        test_size=RF_TEST_SIZE,
-        random_state=RF_RANDOM_STATE,
+
+    X = np.asarray(X, dtype=float)
+    y_mean = np.asarray(y_mean, dtype=float)
+    y_std = np.asarray(y_std, dtype=float)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    dim = X_scaled.shape[1]
+
+    objective_kernel = (
+        ConstantKernel(1.0, (1e-3, 1e3))
+        * RBF(length_scale=np.ones(dim), length_scale_bounds=(1e-2, 1e3))
+        + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-9, 1e3))
     )
-    rf = RandomForestRegressor(
-        n_estimators=mode_params["rf"]["n_trees"],
-        max_depth=mode_params["rf"]["max_depth"],
-        min_samples_split=mode_params["rf"]["min_samples_split"],
-        min_samples_leaf=mode_params["rf"]["min_samples_leaf"],
-        max_features=mode_params["rf"]["max_features"],
-        random_state=RF_RANDOM_STATE,
-        n_jobs=-1,
+    noise_kernel = (
+        ConstantKernel(1.0, (1e-3, 1e3))
+        * RBF(length_scale=np.ones(dim), length_scale_bounds=(1e-2, 1e3))
+        + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-9, 1e3))
     )
-    et = ExtraTreesRegressor(
-        n_estimators=max(120, mode_params["rf"]["n_trees"] // 2),
-        max_depth=mode_params["rf"]["max_depth"],
-        min_samples_split=mode_params["rf"]["min_samples_split"],
-        min_samples_leaf=mode_params["rf"]["min_samples_leaf"],
-        max_features=mode_params["rf"]["max_features"],
-        random_state=RF_RANDOM_STATE,
-        n_jobs=-1,
+
+    if sample_weights is not None:
+        alpha = 1.0 / np.maximum(np.asarray(sample_weights, dtype=float), GPR_NOISE_FLOOR)
+        alpha = alpha / np.mean(alpha) * max(float(np.var(y_mean)) * 0.02, GPR_NOISE_FLOOR)
+    else:
+        alpha = np.full(len(y_mean), max(float(np.var(y_mean)) * 0.02, GPR_NOISE_FLOOR))
+
+    objective_gpr = GaussianProcessRegressor(
+        kernel=objective_kernel,
+        alpha=alpha,
+        normalize_y=True,
+        n_restarts_optimizer=3,
+        random_state=mode_params["bo"]["random_state"],
     )
-    rf.fit(X_train, y_train, sample_weight=w_train)
-    et.fit(X_train, y_train, sample_weight=w_train)
-    y_pred = 0.5 * (rf.predict(X_val) + et.predict(X_val))
-    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
-    return {"rf": rf, "et": et}, rmse
+    noise_gpr = GaussianProcessRegressor(
+        kernel=noise_kernel,
+        alpha=GPR_NOISE_FLOOR,
+        normalize_y=True,
+        n_restarts_optimizer=3,
+        random_state=mode_params["bo"]["random_state"],
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        warnings.simplefilter("ignore", RuntimeWarning)
+        objective_gpr.fit(X_scaled, y_mean)
+        noise_gpr.fit(X_scaled, np.log(np.square(np.maximum(y_std, GPR_NOISE_FLOOR))))
+
+    if len(y_mean) >= max(8, min(RF_MIN_SAMPLES_TO_TRAIN, len(y_mean))):
+        X_train, X_val, y_train, y_val, alpha_train, _ = train_test_split(
+            X_scaled,
+            y_mean,
+            alpha,
+            test_size=RF_TEST_SIZE,
+            random_state=RF_RANDOM_STATE,
+        )
+        val_model = GaussianProcessRegressor(
+            kernel=objective_kernel,
+            alpha=alpha_train,
+            normalize_y=True,
+            n_restarts_optimizer=1,
+            random_state=mode_params["bo"]["random_state"],
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ConvergenceWarning)
+            warnings.simplefilter("ignore", RuntimeWarning)
+            val_model.fit(X_train, y_train)
+            val_pred = val_model.predict(X_val)
+        rmse = float(np.sqrt(mean_squared_error(y_val, val_pred)))
+    else:
+        rmse = float(np.sqrt(mean_squared_error(y_mean, objective_gpr.predict(X_scaled))))
+
+    return {
+        "objective": objective_gpr,
+        "noise": noise_gpr,
+        "scaler": scaler,
+        "target_mean": float(np.mean(y_mean)),
+        "target_std": float(np.std(y_mean)),
+        "noise_log_floor": float(np.log(GPR_NOISE_FLOOR)),
+    }, rmse
 
 
 def load_baseline_vector(filepath):
@@ -63,7 +117,7 @@ def load_baseline_vector(filepath):
     if not lines:
         raise ValueError(f"{filepath} 为空")
 
-    baseline = np.array(list(map(int, lines[0].strip().split('\t'))), dtype=int)
+    baseline = np.array(list(map(int, lines[0].strip().split("\t"))), dtype=int)
     if len(baseline) != N_ACTUATORS:
         raise ValueError(
             f"{filepath} 维度错误，期望 {N_ACTUATORS} 维，实际 {len(baseline)} 维"
@@ -75,8 +129,11 @@ def build_constrained_bounds(baseline):
     """构建相对基准面型的安全搜索范围。"""
     lower = np.maximum(VOLTAGE_BOUNDS[0], baseline - MAX_DELTA_FROM_BASELINE)
     upper = np.minimum(VOLTAGE_BOUNDS[1], baseline + MAX_DELTA_FROM_BASELINE)
-    lower[FROZEN_START_IDX:] = baseline[FROZEN_START_IDX:]
-    upper[FROZEN_START_IDX:] = baseline[FROZEN_START_IDX:]
+
+    frozen_mask = np.ones(N_ACTUATORS, dtype=bool)
+    frozen_mask[OPTIMIZED_DIM_INDICES] = False
+    lower[frozen_mask] = baseline[frozen_mask]
+    upper[frozen_mask] = baseline[frozen_mask]
     return lower.astype(int), upper.astype(int)
 
 
@@ -84,21 +141,24 @@ def enforce_hard_constraints(vector, baseline):
     """应用所有硬性约束。"""
     lower_bounds, upper_bounds = build_constrained_bounds(baseline)
     constrained = np.clip(np.asarray(vector, dtype=float), lower_bounds, upper_bounds)
-    constrained[FROZEN_START_IDX:] = baseline[FROZEN_START_IDX:]
+
+    frozen_mask = np.ones(N_ACTUATORS, dtype=bool)
+    frozen_mask[OPTIMIZED_DIM_INDICES] = False
+    constrained[frozen_mask] = baseline[frozen_mask]
     return constrained.astype(int)
 
 
 def compute_feature_importance(models):
-    """集成模型的平均特征重要性，用于加权探索。"""
-    importance = np.zeros(len(OPTIMIZED_DIM_INDICES), dtype=float)
-    model_count = 0
-    for model in models.values():
-        if hasattr(model, "feature_importances_"):
-            importance += model.feature_importances_
-            model_count += 1
-    if model_count == 0:
+    """用 GPR 的 RBF length scale 估计敏感维度；失败时返回均匀权重。"""
+    if not models or "objective" not in models:
         return np.ones(len(OPTIMIZED_DIM_INDICES), dtype=float) / len(OPTIMIZED_DIM_INDICES)
-    importance = importance / model_count
+
+    try:
+        length_scale = np.asarray(models["objective"].kernel_.k1.k2.length_scale, dtype=float)
+        importance = 1.0 / np.maximum(length_scale, 1e-6)
+    except Exception:
+        importance = np.ones(len(OPTIMIZED_DIM_INDICES), dtype=float)
+
     importance = np.maximum(importance, 1e-6)
     return importance / np.sum(importance)
 
@@ -125,17 +185,18 @@ def build_candidate_pool(X_obs, y_obs, baseline, mode_params, importance_weights
     """全局随机 + 局部扰动，生成下一轮待筛选候选点。"""
     lower_bounds, upper_bounds = build_constrained_bounds(baseline)
     dim = len(OPTIMIZED_DIM_INDICES)
-    adaptive_lower = lower_bounds.copy()
-    adaptive_upper = upper_bounds.copy()
+    lower_opt = lower_bounds[OPTIMIZED_DIM_INDICES]
+    upper_opt = upper_bounds[OPTIMIZED_DIM_INDICES]
 
     if len(y_obs) > 0:
         best_idx = int(np.argmax(y_obs))
         center = np.asarray(X_obs[best_idx], dtype=int)
     else:
-        center = baseline[:dim]
+        center = baseline[OPTIMIZED_DIM_INDICES]
 
-    adaptive_lower[:dim] = np.maximum(adaptive_lower[:dim], center - trust_radius)
-    adaptive_upper[:dim] = np.minimum(adaptive_upper[:dim], center + trust_radius)
+    adaptive_lower = np.maximum(lower_opt, center - trust_radius)
+    adaptive_upper = np.minimum(upper_opt, center + trust_radius)
+
     rng = np.random.default_rng(mode_params["bo"]["random_state"])
     n_candidates = mode_params["bo"]["n_candidates"]
     global_count = max(2000, n_candidates // 2)
@@ -159,7 +220,7 @@ def build_candidate_pool(X_obs, y_obs, baseline, mode_params, importance_weights
                 weighted_scale = scale * (0.5 + 2.0 * importance_weights)
                 noise = rng.normal(0, weighted_scale, size=(per_seed, dim))
                 perturbed = np.rint(seed + noise).astype(int)
-                perturbed = np.clip(perturbed, adaptive_lower[:dim], adaptive_upper[:dim])
+                perturbed = np.clip(perturbed, adaptive_lower, adaptive_upper)
                 local_candidates.append(perturbed)
 
     baseline_seed = np.repeat(
@@ -173,7 +234,7 @@ def build_candidate_pool(X_obs, y_obs, baseline, mode_params, importance_weights
         size=baseline_seed.shape,
     )
     baseline_points = np.rint(baseline_seed + baseline_noise).astype(int)
-    baseline_points = np.clip(baseline_points, lower_bounds[:dim], upper_bounds[:dim])
+    baseline_points = np.clip(baseline_points, lower_opt, upper_opt)
 
     all_blocks = [global_points, baseline_points]
     if local_candidates:
@@ -195,35 +256,85 @@ def build_candidate_pool(X_obs, y_obs, baseline, mode_params, importance_weights
 
 
 def predict_with_uncertainty(models, X):
-    """用集成树模型的树间分散度近似预测不确定性。"""
-    tree_preds = []
-    for model in models.values():
-        tree_preds.extend(est.predict(X) for est in model.estimators_)
-    tree_matrix = np.vstack(tree_preds)
-    mean_pred = np.mean(tree_matrix, axis=0)
-    std_pred = np.std(tree_matrix, axis=0)
-    return mean_pred, std_pred
+    """用目标 GPR 预测均值和模型不确定性。"""
+    X_scaled = models["scaler"].transform(np.asarray(X, dtype=float))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mean_pred, std_pred = models["objective"].predict(X_scaled, return_std=True)
+    mean_pred = np.nan_to_num(
+        mean_pred,
+        nan=models["target_mean"],
+        posinf=models["target_mean"] + 5.0 * max(models["target_std"], 1.0),
+        neginf=models["target_mean"] - 5.0 * max(models["target_std"], 1.0),
+    )
+    std_pred = np.nan_to_num(
+        std_pred,
+        nan=max(models["target_std"], 1.0),
+        posinf=max(models["target_std"], 1.0),
+        neginf=1.0,
+    )
+    return mean_pred, np.maximum(std_pred, 1e-12)
+
+
+def predict_noise_std(models, X):
+    """用噪声 GPR 预测该参数点的 shot 波动标准差。"""
+    X_scaled = models["scaler"].transform(np.asarray(X, dtype=float))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        log_var = models["noise"].predict(X_scaled)
+    log_var = np.nan_to_num(
+        log_var,
+        nan=models["noise_log_floor"],
+        posinf=np.log(max(models["target_std"] ** 2, GPR_NOISE_FLOOR)),
+        neginf=models["noise_log_floor"],
+    )
+    return np.sqrt(np.exp(log_var))
+
+
+def expected_improvement(mean_pred, std_pred, best_y, xi=0.01):
+    """标准 Expected Improvement。"""
+    std_pred = np.maximum(std_pred, 1e-12)
+    improvement = mean_pred - best_y - xi
+    z = improvement / std_pred
+    ei = improvement * norm.cdf(z) + std_pred * norm.pdf(z)
+    return np.maximum(ei, 0.0)
+
+
+def augmented_acquisition(mean_pred, model_std, noise_std, best_y, xi=0.01):
+    """增强采集函数：EI * eta，惩罚高 shot 波动区域。"""
+    ei = expected_improvement(mean_pred, model_std, best_y, xi=xi)
+    eta = 1.0 - noise_std / np.sqrt(model_std**2 + noise_std**2 + 1e-12)
+    return ei * np.clip(eta, 0.0, 1.0)
 
 
 def propose_next(models, baseline, X_obs, y_obs, mode_params):
-    """利用候选搜索 + UCB 推荐下一个点。"""
+    """利用候选搜索 + 增强 EI 推荐下一个点。"""
     importance_weights = compute_feature_importance(models)
     trust_radius = compute_trust_radius(y_obs)
     candidates, trust_radius = build_candidate_pool(
         X_obs, y_obs, baseline, mode_params, importance_weights, trust_radius
     )
+
     mean_pred, std_pred = predict_with_uncertainty(models, candidates)
-    beta = mode_params["bo"]["exploration_beta"]
-    ucb = mean_pred + beta * std_pred
-    best_idx = int(np.argmax(ucb))
+    noise_std = predict_noise_std(models, candidates)
+    acq = augmented_acquisition(
+        mean_pred,
+        std_pred,
+        noise_std,
+        float(np.max(y_obs)),
+        xi=mode_params["bo"].get("xi", 0.01),
+    )
+    acq = np.nan_to_num(acq, nan=-np.inf, posinf=np.finfo(float).max, neginf=-np.inf)
+    best_idx = int(np.argmax(acq))
 
     x_next = baseline.astype(float).copy()
     x_next[OPTIMIZED_DIM_INDICES] = candidates[best_idx]
     x_next = enforce_hard_constraints(x_next, baseline)
+
     ranked_dims = np.argsort(importance_weights)[::-1]
     top_dims = [
         {
-            "dimension": f"a{int(idx)}",
+            "dimension": f"a{int(OPTIMIZED_DIM_INDICES[idx])}",
             "importance": float(importance_weights[idx]),
         }
         for idx in ranked_dims[: min(5, len(ranked_dims))]

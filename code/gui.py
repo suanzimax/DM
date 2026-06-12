@@ -4,6 +4,8 @@ import os
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.getcwd(), ".matplotlib_cache"))
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -14,14 +16,14 @@ from config import (
     DATA_FILE,
     DEFAULT_REPEAT_SHOTS,
     FAST_MODE_PARAMS,
-    FROZEN_START_IDX,
     MAX_DELTA_FROM_BASELINE,
     N_ACTUATORS,
     OPTIMIZED_DIM_INDICES,
     PRECISE_MODE_PARAMS,
+    WINDOWS_SHARE_DIR,
 )
 from config_viewer import ConfigViewer
-from file_io import save_data, save_dm_txt
+from file_io import copy_file_to_windows_share, save_data, save_dm_txt
 from model import (
     build_constrained_bounds,
     enforce_hard_constraints,
@@ -50,6 +52,16 @@ plt.rcParams["font.sans-serif"] = [
     "DejaVu Sans",
 ]
 plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams.update(
+    {
+        "font.size": 8,
+        "axes.titlesize": 9,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 7,
+        "legend.fontsize": 7,
+    }
+)
 
 
 class BO_GUI:
@@ -82,14 +94,23 @@ class BO_GUI:
         self.lower_bounds, self.upper_bounds = build_constrained_bounds(self.baseline)
 
         self.shot_id = len(self.y) + 1
+        self.initial_sample_count = len(self.y)
         self.energy_history = []
         self.rmse_history = []
-        self.best_energy = -1
+        self.holdout_sample_counts = []
+        self.cv_rmse_history = []
+        self.relative_rmse_history = []
+        self.cv_r2_history = []
+        self.metric_sample_counts = []
+        self.best_energy = float(np.max(self.y)) if len(self.y) else -1
         self.current = None
         self.training_effect = None
         self.current_shot_energies = []
         self.current_shot_target = DEFAULT_REPEAT_SHOTS
         self.latest_recommendation_signal = None
+        self.optimized_dim_set = set(OPTIMIZED_DIM_INDICES)
+        self.latest_config_file = None
+        self.latest_windows_config_file = None
 
         self.setup_ui()
         self.refresh_training_effect(log_action=True)
@@ -165,6 +186,16 @@ class BO_GUI:
         )
         self.btn_view_config.pack(pady=5, fill=tk.X)
 
+        self.btn_resend_config = tk.Button(
+            left_frame,
+            text="重新发送配置到 Windows",
+            command=self.resend_latest_config,
+            font=("Arial", 12),
+            bg="#ffdca8",
+            state=tk.DISABLED,
+        )
+        self.btn_resend_config.pack(pady=5, fill=tk.X)
+
         tk.Label(left_frame, text="输入实验能量:", font=("Arial", 10)).pack(pady=(20, 5))
 
         self.entry_energy = tk.Entry(left_frame, width=15, font=("Arial", 12))
@@ -206,11 +237,12 @@ class BO_GUI:
         surface_frame = tk.LabelFrame(left_frame, text="当前推荐面形", font=("Arial", 10))
         surface_frame.pack(pady=(15, 5), fill=tk.BOTH, expand=True)
 
-        columns = ("执行器", "基准值", "推荐值", "变化量")
+        columns = ("执行器", "基准值", "推荐值", "变化量", "安全占比", "状态")
         self.surface_tree = ttk.Treeview(surface_frame, columns=columns, show="headings", height=10)
         for col in columns:
             self.surface_tree.heading(col, text=col)
-            self.surface_tree.column(col, width=74, anchor="center")
+            width = 62 if col in ("执行器", "状态") else 74
+            self.surface_tree.column(col, width=width, anchor="center")
 
         surface_scrollbar = ttk.Scrollbar(surface_frame, orient="vertical", command=self.surface_tree.yview)
         self.surface_tree.configure(yscrollcommand=surface_scrollbar.set)
@@ -225,7 +257,11 @@ class BO_GUI:
 
         self.label_baseline_info = tk.Label(
             left_frame,
-            text=f"基准面形来源: {BASELINE_FILE} 第一行 52 维电压",
+            text=(
+                f"基准面形来源: {BASELINE_FILE} 第一行 52 维电压\n"
+                f"安全阈值: 每个优化维度相对基准不超过 ±{MAX_DELTA_FROM_BASELINE}\n"
+                f"优化维度: {OPTIMIZED_DIM_INDICES}"
+            ),
             font=("Arial", 9),
             fg="gray",
             wraplength=260,
@@ -233,12 +269,67 @@ class BO_GUI:
         )
         self.label_baseline_info.pack(pady=(4, 0), fill=tk.X)
 
-        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(9, 8))
+        self.fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.2), constrained_layout=True)
+        self.ax1, self.ax2, self.ax3, self.ax4 = axes.ravel()
+        self.fig.set_constrained_layout_pads(w_pad=0.04, h_pad=0.04, wspace=0.12, hspace=0.16)
         self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def view_config(self):
         ConfigViewer(self.root)
+
+    def resend_latest_config(self):
+        """将最近一次生成的推荐 txt 重新复制到 Windows 共享目录。"""
+        if not self.latest_config_file:
+            append_operation_log("resend_config_to_windows", "blocked", {"reason": "no_latest_config"})
+            messagebox.showwarning("提示", "还没有可重新发送的配置文件，请先推荐新配置")
+            return
+
+        if not os.path.exists(self.latest_config_file):
+            append_operation_log(
+                "resend_config_to_windows",
+                "error",
+                {"reason": "local_config_missing", "local_file": self.latest_config_file},
+            )
+            messagebox.showerror("错误", f"本地配置文件不存在:\n{self.latest_config_file}")
+            return
+
+        windows_filename = copy_file_to_windows_share(self.latest_config_file)
+        if windows_filename:
+            self.latest_windows_config_file = windows_filename
+            if self.latest_recommendation_signal is not None:
+                self.latest_recommendation_signal["windows_shared_config_file"] = windows_filename
+                persist_recommendation_signal(self.latest_recommendation_signal)
+            append_operation_log(
+                "resend_config_to_windows",
+                "success",
+                {
+                    "local_file": self.latest_config_file,
+                    "windows_shared_config_file": windows_filename,
+                },
+            )
+            self.label_status.config(
+                text=(
+                    f"配置文件已重新发送到 Windows 共享:\n{windows_filename}\n\n"
+                    f"本地文件:\n{self.latest_config_file}\n\n"
+                    "可以继续加载该配置或记录实验 shot"
+                )
+            )
+            messagebox.showinfo("成功", f"已重新发送到 Windows 共享:\n{windows_filename}")
+        else:
+            append_operation_log(
+                "resend_config_to_windows",
+                "error",
+                {
+                    "reason": "copy_failed",
+                    "local_file": self.latest_config_file,
+                    "windows_share_dir": WINDOWS_SHARE_DIR,
+                },
+            )
+            messagebox.showerror(
+                "发送失败",
+                f"没有复制成功，请检查 Windows 共享是否已挂载:\n{WINDOWS_SHARE_DIR}",
+            )
 
     def get_mode_params(self):
         return FAST_MODE_PARAMS if self.mode_var.get() == "fast" else PRECISE_MODE_PARAMS
@@ -247,16 +338,33 @@ class BO_GUI:
         mode_params = self.get_mode_params()
         summary = assess_training_effect(self.X_opt, self.y, mode_params)
         self.training_effect = summary
+        if (
+            summary.get("cv_rmse") is not None
+            and (
+                not self.metric_sample_counts
+                or self.metric_sample_counts[-1] != int(summary["sample_count"])
+            )
+        ):
+            self.metric_sample_counts.append(int(summary["sample_count"]))
+            self.cv_rmse_history.append(float(summary["cv_rmse"]))
+            self.relative_rmse_history.append(float(summary["relative_rmse"]))
+            self.cv_r2_history.append(float(summary["cv_r2"]))
         persist_training_summary(summary)
         if log_action:
             append_operation_log("training_effect_assessed", "success", summary)
 
     def update_shot_buffer_display(self):
         mean_text = format_sci(np.mean(self.current_shot_energies)) if self.current_shot_energies else "N/A"
+        std_text = (
+            format_sci(np.std(self.current_shot_energies, ddof=1))
+            if len(self.current_shot_energies) > 1
+            else "N/A"
+        )
         self.label_shot_buffer.config(
             text=(
                 f"当前点重复 shot: {len(self.current_shot_energies)} / {self.current_shot_target}\n"
-                f"均值: {mean_text}"
+                f"均值: {mean_text}\n"
+                f"标准差: {std_text}"
             )
         )
 
@@ -275,14 +383,37 @@ class BO_GUI:
             baseline_val = int(self.baseline[idx])
             current_val = int(self.current[idx])
             delta = current_val - baseline_val
-            tag = "changed" if delta != 0 else ""
+            usage = abs(delta) / max(MAX_DELTA_FROM_BASELINE, 1)
+            usage_text = f"{usage * 100:.1f}%"
+            if idx not in self.optimized_dim_set:
+                status = "固定"
+                tag = "frozen"
+            elif usage >= 0.9:
+                status = "接近阈值"
+                tag = "near_limit"
+            elif delta != 0:
+                status = "优化"
+                tag = "changed"
+            else:
+                status = "优化"
+                tag = "optimized"
             self.surface_tree.insert(
                 "",
                 "end",
-                values=(f"A{idx}", str(baseline_val), str(current_val), f"{delta:+d}"),
+                values=(
+                    f"A{idx}",
+                    str(baseline_val),
+                    str(current_val),
+                    f"{delta:+d}",
+                    usage_text,
+                    status,
+                ),
                 tags=(tag,),
             )
         self.surface_tree.tag_configure("changed", background="lightyellow")
+        self.surface_tree.tag_configure("optimized", background="#eef6ff")
+        self.surface_tree.tag_configure("near_limit", background="#ffd6d6")
+        self.surface_tree.tag_configure("frozen", foreground="gray")
 
         self.vector_text.config(state=tk.NORMAL)
         self.vector_text.delete("1.0", tk.END)
@@ -290,43 +421,168 @@ class BO_GUI:
         self.vector_text.config(state=tk.DISABLED)
 
     def update_plot(self):
+        for extra_axis in list(self.fig.axes[4:]):
+            extra_axis.remove()
+
         self.ax1.clear()
         self.ax2.clear()
+        self.ax3.clear()
+        self.ax4.clear()
 
-        if self.energy_history:
-            shots = list(range(1, len(self.energy_history) + 1))
-            self.ax1.plot(shots, self.energy_history, marker="o", linewidth=2, markersize=6)
-            self.ax1.axhline(
-                y=max(self.energy_history),
-                color="red",
-                linestyle="--",
-                alpha=0.7,
-                label=f"最大值: {max(self.energy_history):.3f} MeV",
-            )
-            self.ax1.legend()
+        sample_ids = np.arange(1, len(self.y) + 1)
+        if len(self.y):
+            yerr = np.nan_to_num(self.shot_std, nan=0.0, posinf=0.0, neginf=0.0)
+            has_error = np.any(yerr > 0)
+            if has_error:
+                self.ax1.errorbar(
+                    sample_ids,
+                    self.y,
+                    yerr=yerr,
+                    fmt="o-",
+                    linewidth=1.1,
+                    markersize=3,
+                    capsize=1.8,
+                    color="tab:blue",
+                    ecolor="lightsteelblue",
+                    label="mean ± std",
+                )
+            else:
+                self.ax1.plot(sample_ids, self.y, "o-", linewidth=1.1, markersize=3, label="mean")
+            if len(self.y) > self.initial_sample_count:
+                self.ax1.axvline(
+                    self.initial_sample_count + 0.5,
+                    color="gray",
+                    linestyle=":",
+                    linewidth=1,
+                )
+            self.ax1.legend(loc="best")
 
-        self.ax1.set_title("实验能量优化曲线", fontsize=14)
-        self.ax1.set_xlabel("Shot ID")
-        self.ax1.set_ylabel("能量 (MeV)")
+        self.ax1.set_title("BO 迭代效果")
+        self.ax1.set_xlabel("样本序号")
+        self.ax1.set_ylabel("mean energy")
+        self.ax1.ticklabel_format(axis="y", style="sci", scilimits=(-2, 3))
         self.ax1.grid(True, alpha=0.3)
 
-        if self.rmse_history:
-            iterations = list(range(1, len(self.rmse_history) + 1))
-            self.ax2.plot(iterations, self.rmse_history, marker="s", color="orange", linewidth=2, markersize=6)
+        if len(self.y):
+            self.ax2.plot(
+                sample_ids,
+                self.shot_std,
+                marker="o",
+                linewidth=1.1,
+                markersize=3,
+                color="tab:orange",
+                label="shot_std",
+            )
+            ax2_repeat = self.ax2.twinx()
+            ax2_repeat.bar(
+                sample_ids,
+                self.repeat_count,
+                color="lightgray",
+                alpha=0.45,
+                width=0.8,
+                label="repeat_count",
+            )
+            ax2_repeat.set_ylabel("repeat_count")
+            ax2_repeat.tick_params(axis="y", labelsize=7)
+            lines, labels = self.ax2.get_legend_handles_labels()
+            bars, bar_labels = ax2_repeat.get_legend_handles_labels()
+            self.ax2.legend(lines + bars, labels + bar_labels, loc="best")
 
-        self.ax2.set_title("Surrogate模型RMSE曲线", fontsize=14)
-        self.ax2.set_xlabel("迭代次数")
-        self.ax2.set_ylabel("RMSE")
+        self.ax2.set_title("Shot 稳定性")
+        self.ax2.set_xlabel("样本序号")
+        self.ax2.set_ylabel("shot_std")
+        self.ax2.ticklabel_format(axis="y", style="sci", scilimits=(-2, 3))
         self.ax2.grid(True, alpha=0.3)
 
-        self.fig.tight_layout()
+        metric_x = self.metric_sample_counts if self.metric_sample_counts else list(range(1, len(self.cv_rmse_history) + 1))
+        if self.cv_rmse_history:
+            self.ax3.plot(
+                metric_x,
+                self.cv_rmse_history,
+                marker="o",
+                linewidth=1.1,
+                color="tab:purple",
+                label="CV RMSE",
+            )
+        if self.rmse_history:
+            self.ax3.plot(
+                self.holdout_sample_counts,
+                self.rmse_history,
+                marker="s",
+                linestyle="--",
+                linewidth=1.0,
+                color="tab:brown",
+                label="Holdout RMSE",
+            )
+        ax3_quality = self.ax3.twinx()
+        if self.relative_rmse_history:
+            ax3_quality.plot(
+                metric_x,
+                self.relative_rmse_history,
+                marker="^",
+                linewidth=1.0,
+                color="tab:green",
+                label="relative RMSE",
+            )
+        if self.cv_r2_history:
+            ax3_quality.plot(
+                metric_x,
+                self.cv_r2_history,
+                marker="x",
+                linewidth=1.0,
+                color="tab:red",
+                label="CV R²",
+            )
+        self.ax3.set_title("模型统计")
+        self.ax3.set_xlabel("样本数")
+        self.ax3.set_ylabel("RMSE")
+        self.ax3.ticklabel_format(axis="y", style="sci", scilimits=(-2, 3))
+        ax3_quality.set_ylabel("rel. RMSE / R²")
+        ax3_quality.tick_params(axis="y", labelsize=7)
+        self.ax3.grid(True, alpha=0.3)
+        lines, labels = self.ax3.get_legend_handles_labels()
+        quality_lines, quality_labels = ax3_quality.get_legend_handles_labels()
+        if lines or quality_lines:
+            self.ax3.legend(lines + quality_lines, labels + quality_labels, loc="best")
+
+        dims = np.arange(N_ACTUATORS)
+        if self.current is not None:
+            deltas = self.current.astype(float) - self.baseline.astype(float)
+            colors = ["tab:blue" if idx in self.optimized_dim_set else "lightgray" for idx in dims]
+            self.ax4.bar(dims, deltas, color=colors, width=0.85)
+        else:
+            self.ax4.bar(dims, np.zeros(N_ACTUATORS), color="lightgray", width=0.85)
+            self.ax4.text(
+                0.5,
+                0.5,
+                "尚未生成推荐面形",
+                transform=self.ax4.transAxes,
+                ha="center",
+                va="center",
+                color="gray",
+                fontsize=9,
+            )
+        self.ax4.axhline(MAX_DELTA_FROM_BASELINE, color="red", linestyle="--", linewidth=1)
+        self.ax4.axhline(-MAX_DELTA_FROM_BASELINE, color="red", linestyle="--", linewidth=1)
+        self.ax4.set_ylim(-MAX_DELTA_FROM_BASELINE * 1.2, MAX_DELTA_FROM_BASELINE * 1.2)
+        self.ax4.set_title("面形安全")
+        self.ax4.set_xlabel("执行器维度")
+        self.ax4.set_ylabel("推荐 - 基准")
+        self.ax4.grid(True, axis="y", alpha=0.3)
+        for axis in (self.ax1, self.ax2, self.ax3, self.ax4):
+            axis.tick_params(axis="both", labelsize=7)
+            axis.yaxis.get_offset_text().set_fontsize(7)
+            axis.xaxis.get_offset_text().set_fontsize(7)
         self.canvas.draw()
 
-        stats_text = f"总实验次数: {len(self.energy_history)}\n"
-        stats_text += f"训练样本数: {len(self.y)}\n"
-        if self.energy_history:
-            stats_text += f"当前最优: {format_sci(max(self.energy_history))} MeV\n"
-            stats_text += f"平均能量: {format_sci(np.mean(self.energy_history))} MeV\n"
+        stats_text = f"训练样本数: {len(self.y)}\n"
+        stats_text += f"实验起点: {DATA_FILE} 前 {self.initial_sample_count} 条\n"
+        stats_text += f"下一推荐编号: {self.shot_id}\n"
+        stats_text += f"本次启动后提交点数: {len(self.energy_history)}\n"
+        if len(self.y):
+            stats_text += f"当前最优: {format_sci(np.max(self.y))}\n"
+            stats_text += f"平均能量: {format_sci(np.mean(self.y))}\n"
+            stats_text += f"平均shot_std: {format_sci(np.mean(self.shot_std))}\n"
         if self.rmse_history:
             stats_text += f"本轮Holdout RMSE: {format_sci(self.rmse_history[-1])}\n"
         if self.training_effect:
@@ -399,18 +655,25 @@ class BO_GUI:
     def propose_config(self):
         mode_params = self.get_mode_params()
         self.refresh_training_effect(log_action=True)
-        rf, rmse = train_surrogate(self.X_opt, self.y, mode_params, self.sample_weights)
-        if rf is None:
+        models, rmse = train_surrogate(
+            self.X_opt,
+            self.y,
+            self.shot_std,
+            mode_params,
+            self.sample_weights,
+        )
+        if models is None:
             append_operation_log(
                 "propose_config", "blocked", {"reason": "insufficient_data", "sample_count": int(len(self.y))}
             )
-            messagebox.showwarning("提示", "数据不足，请先积累更多点")
+            messagebox.showwarning("提示", "GPR 数据不足，请先积累更多点")
             return
 
         self.rmse_history.append(rmse)
+        self.holdout_sample_counts.append(int(len(self.y)))
 
         x_next, pred, pred_std, candidate_count, trust_radius, top_dims = propose_next(
-            rf, self.baseline, self.X_opt, self.y, mode_params
+            models, self.baseline, self.X_opt, self.y, mode_params
         )
         self.current = enforce_hard_constraints(x_next, self.baseline)
         self.current_shot_energies = []
@@ -420,13 +683,11 @@ class BO_GUI:
         suggest_repeat, suggest_message = evaluate_repeat_validation_need(
             pred, pred_std, current_best, self.training_effect
         )
-        if suggest_repeat:
-            self.current_shot_target = 3
-            self.entry_repeat_count.delete(0, tk.END)
-            self.entry_repeat_count.insert(0, "3")
-            self.update_shot_buffer_display()
 
         local_filename, windows_filename = save_dm_txt(self.current, self.shot_id)
+        self.latest_config_file = local_filename
+        self.latest_windows_config_file = windows_filename
+        self.btn_resend_config.config(state=tk.NORMAL)
         filename_display = local_filename
         if windows_filename:
             filename_display += f"\nWindows共享: {windows_filename}"
@@ -444,8 +705,9 @@ class BO_GUI:
                 f"当前信赖域半径: ±{trust_radius}\n"
                 f"高敏感维度: {top_dims_text}\n"
                 f"重复验证判断: {suggest_message}\n"
-                f"约束: 0-9 维相对 {BASELINE_FILE} 不超过 ±{MAX_DELTA_FROM_BASELINE}\n"
-                f"约束: 10-51 维与 {BASELINE_FILE} 完全一致\n\n"
+                f"优化维度: {OPTIMIZED_DIM_INDICES}\n"
+                f"安全约束: 优化维度相对 {BASELINE_FILE} 不超过 ±{MAX_DELTA_FROM_BASELINE}\n"
+                "非优化维度保持初始面形不变\n\n"
                 f"基于当前 lhs_data.csv 的估计，还需约 {remain} 才可能进入局部收敛\n\n"
                 f"当前模式: {'快模式' if self.mode_var.get() == 'fast' else '精细模式'}\n\n"
                 "请实验员加载后逐发记录，再按均值提交当前点"
@@ -462,7 +724,7 @@ class BO_GUI:
             "best_observed_energy": current_best,
             "repeat_validation_recommended": bool(suggest_repeat),
             "repeat_validation_message": suggest_message,
-            "recommended_repeat_count": 3 if suggest_repeat else int(self.current_shot_target),
+            "recommended_repeat_count": int(self.current_shot_target),
             "config_file": local_filename,
             "windows_shared_config_file": windows_filename,
             "convergence_stage": self.training_effect["convergence_stage"] if self.training_effect else None,
@@ -506,7 +768,13 @@ class BO_GUI:
         energy = float(np.mean(self.current_shot_energies))
         shot_std = float(np.std(self.current_shot_energies, ddof=1)) if len(self.current_shot_energies) > 1 else 0.0
         repeat_count = len(self.current_shot_energies)
-        save_data(self.current, energy, shot_std=shot_std, repeat_count=repeat_count)
+        save_data(
+            self.current,
+            energy,
+            shot_std=shot_std,
+            repeat_count=repeat_count,
+            repeat_values=self.current_shot_energies,
+        )
         self.X_opt = np.vstack([self.X_opt, self.current[OPTIMIZED_DIM_INDICES]])
         self.y = np.append(self.y, energy)
         self.shot_std = np.append(self.shot_std, shot_std)
